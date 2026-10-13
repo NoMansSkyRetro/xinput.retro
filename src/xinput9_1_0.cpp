@@ -1,15 +1,19 @@
 // Drop-in xinput9_1_0.dll for No Man's Sky. Every build, GOG or Steam, imports XInputGetState and
 // XInputSetState from this DLL, so it loads before any game code runs.
 //
-// Steam builds from at least Beyond 2.16 on construct a cTkInputManagerSteam, which routes controllers
-// through Steam Input. The base cTkInputManager it derives from is the class the GOG build uses,
-// and its XInput path is still compiled into the Steam executable. This DLL copies the base
-// class's vtable over the Steam one, so the game runs the GOG input code. No build-specific
-// offsets are used. The two vtables are found either through MSVC RTTI by class name (3.x on), or,
-// in builds compiled without RTTI (2.x), through the code that initializes Steam Input.
+// Steam builds from at least Beyond 2.16 on differ from GOG's in two places, and this DLL undoes
+// both without build-specific offsets:
 //
-// Builds without that class are left alone. GOG builds have no Steam class, and the 1.x Steam
-// builds read XInput the same way GOG does, with Steam Controller layered on top.
+// 1. They construct a cTkInputManagerSteam, which routes controllers through Steam Input. The base
+//    cTkInputManager it derives from is the class the GOG build uses, and it is still compiled
+//    into the Steam executable, so the base vtable is copied over the Steam one. The two vtables
+//    are found through MSVC RTTI by class name (3.x on), or, in builds compiled without RTTI
+//    (2.x), through the code that initializes Steam Input.
+// 2. Their LoadBindings never registers the Xbox pad bindings, so the XInput pad is detected but
+//    no input port reads it. Two calls in it are redirected to put that step back.
+//
+// GOG builds are left alone, and so are the 1.x Steam builds, which read XInput the same way GOG
+// does, with Steam Controller layered on top.
 #define NOMINMAX
 #include <windows.h>
 #include <stdarg.h>
@@ -41,6 +45,9 @@ static bool put(void* at, const void* src, size_t n) {
     VirtualProtect(at, n, old, &old);
     return true;
 }
+
+static const char kPadBindings[] = "Metadata/Input/Bindings/GcInputBindings_XboxOne_Pad.mXml";
+static const char kMouseBindings[] = "Metadata/Input/Bindings/GcInputBindings_Win_Mouse.mXml";
 
 struct Image {
     BYTE* base;
@@ -85,8 +92,9 @@ struct Image {
         }
     }
 
-    // Start of the function containing rva, from .pdata, following chained unwind info. 0 if none.
-    DWORD func_start(DWORD r) const {
+    // The .pdata entry of the function containing rva, following chained unwind info to the
+    // function's first chunk. Null if none.
+    RUNTIME_FUNCTION* func(DWORD r) const {
         IMAGE_DATA_DIRECTORY& d = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
         RUNTIME_FUNCTION* rf = (RUNTIME_FUNCTION*)(base + d.VirtualAddress);
         size_t lo = 0, hi = d.Size / sizeof(RUNTIME_FUNCTION);
@@ -94,15 +102,21 @@ struct Image {
             size_t mid = (lo + hi) / 2;
             if (rf[mid].BeginAddress <= r) lo = mid + 1; else hi = mid;
         }
-        if (!lo || r >= rf[lo - 1].EndAddress) return 0;
+        if (!lo || r >= rf[lo - 1].EndAddress) return nullptr;
         RUNTIME_FUNCTION* f = &rf[lo - 1];
         for (int i = 0; i < 8; i++) {
             BYTE* ui = base + f->UnwindData;
             if (!((ui[0] >> 3) & UNW_FLAG_CHAININFO)) break;
             f = (RUNTIME_FUNCTION*)(ui + 4 + ((ui[2] + 1) & ~1) * 2);
         }
-        return f->BeginAddress;
+        return f;
     }
+    DWORD func_start(DWORD r) const {
+        RUNTIME_FUNCTION* f = func(r);
+        return f ? f->BeginAddress : 0;
+    }
+    bool is_func(BYTE* p) const { return in((UINT64)p, true) && func_start(rva(p)) == rva(p); }
+    static BYTE* call_target(BYTE* call) { return call + 5 + *(INT32*)(call + 1); }
 
     // The import address table slot of fn, imported from a DLL whose name starts with dll.
     void** import_slot(const char* dll, const char* fn) const {
@@ -215,6 +229,46 @@ struct Image {
         *n = std::min(slots_from(best.first), slots_from(best.second));
         return *n > 0;
     }
+
+    // The Steam builds' cGcInputRemap::LoadBindings registers only the keyboard and mouse binding
+    // files, where GOG's also registers kPadBindings and attaches it to the active input port as the
+    // XInput pad. Finds the two calls that step goes next to:
+    //     lea   rdx, [kMouseBindings]
+    //     call  RegisterBindings          <- reg
+    //     ...
+    //     call  AddBindings               <- add, the first call to it after reg (active port)
+    // AddBindings is the function called most often in the next 0x100 bytes (keyboard and mouse,
+    // for two ports). 3.x and 4.x call a short overload of it; main is the full one it forwards to.
+    bool pad_binding_sites(BYTE** reg, BYTE** add, BYTE** main) const {
+        auto find = [&](const char* s, size_t n) { return scan(1, [&](BYTE* p) { return *p == 'M' && !memcmp(p, s, n); }); };
+        if (find(kPadBindings, sizeof kPadBindings)) return false;  // GOG, which loads them already
+        BYTE* str = find(kMouseBindings, sizeof kMouseBindings);
+        if (!str) return false;
+        BYTE* lea = nullptr;
+        each_code_byte([&](BYTE* p) {
+            if (!lea && p[0] == 0x48 && p[1] == 0x8D && p[2] == 0x15 && p + 7 + *(INT32*)(p + 3) == str) lea = p;
+        });
+        if (!lea) return false;
+        *reg = nullptr;
+        for (BYTE* p = lea + 7; p < lea + 0x20 && !*reg; p++)
+            if (*p == 0xE8 && is_func(call_target(p))) *reg = p;
+        if (!*reg) return false;
+        std::vector<BYTE*> calls;
+        for (BYTE* p = *reg + 5; p < *reg + 0x100; p++)
+            if (*p == 0xE8 && is_func(call_target(p))) calls.push_back(p);
+        int most = 0;
+        for (BYTE* c : calls) {
+            int k = (int)std::count_if(calls.begin(), calls.end(), [&](BYTE* d) { return call_target(d) == call_target(c); });
+            if (k > most) most = k, *add = c;
+        }
+        if (most < 2) return false;
+        *main = call_target(*add);
+        RUNTIME_FUNCTION* f = func(rva(*main));
+        if (f && f->EndAddress - f->BeginAddress < 0x80)
+            for (BYTE* p = *main; p < base + f->EndAddress - 5; p++)
+                if (*p == 0xE8 && is_func(call_target(p))) { *main = call_target(p); break; }
+        return true;
+    }
 };
 
 // Returns the number of vtable slots switched to the base class, 0 when there is nothing to do.
@@ -242,6 +296,71 @@ extern "C" __declspec(dllexport) int RetroXInputPatch(HMODULE exe) {
     return n;
 }
 
+typedef int (*register_fn)(void* self, const char* path, void*, void*);
+typedef int (*add_fn)(void* port, INT64, INT64, INT64, INT64, INT64, INT64);
+static register_fn g_register;
+static add_fn g_add, g_add_main;
+static int g_pad_bindings = -1;
+
+static int register_hook(void* self, const char* path, void* a, void* b) {
+    int id = g_register(self, path, a, b);
+    g_pad_bindings = g_register(self, kPadBindings, a, b);
+    return id;
+}
+
+static int add_hook(void* port, INT64 a, INT64 b, INT64 c, INT64 d, INT64 e, INT64 f) {
+    int r = g_add(port, a, b, c, d, e, f);
+    if (g_pad_bindings >= 0) {
+        // EButtonPad (3), EPad_XInput (1), no hand, the pad bindings, nothing chained either side
+        g_add_main(port, 3, 1, 0, g_pad_bindings, -1, -1);
+        say("Xbox pad bindings %d attached to input port %p", g_pad_bindings, port);
+        g_pad_bindings = -1;
+    }
+    return r;
+}
+
+// Points the rel32 call at site to fn, through a jump stub allocated within reach of the image.
+static bool redirect_call(BYTE* image, BYTE* site, void* fn) {
+    static BYTE* stubs;
+    static int used;
+    if (stubs && (stubs > site || site - stubs > 0x70000000)) stubs = nullptr, used = 0;  // another image
+    UINT64 lowest = (UINT64)image > 0x70000000 ? (UINT64)image - 0x70000000 : 0x10000;
+    for (UINT64 a = ((UINT64)image & ~0xFFFFull) - 0x10000; !stubs && a > lowest; a -= 0x10000)
+        stubs = (BYTE*)VirtualAlloc((void*)a, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!stubs || used == 0x1000 / 16) return false;
+    BYTE* stub = stubs + 16 * used++;
+    BYTE jmp[14] = {0xFF, 0x25};  // jmp [rip+0], followed by the target
+    memcpy(jmp + 6, &fn, 8);
+    memcpy(stub, jmp, sizeof jmp);
+    INT32 rel = INT32(stub - (site + 5));
+    DWORD old;
+    if (!VirtualProtect(site + 1, 4, PAGE_EXECUTE_READWRITE, &old)) return false;
+    memcpy(site + 1, &rel, 4);
+    VirtualProtect(site + 1, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, 5);
+    return true;
+}
+
+// Puts back the step that registers the Xbox pad bindings, which every Steam build from 2.16 on
+// leaves out of LoadBindings. Without it the pad is detected but no input port reads it. The
+// bindings file still ships in the Steam paks. Returns 1 when both calls were redirected, 0 when
+// there is nothing to do. Exported so tests\check.py can run it on mapped executables.
+extern "C" __declspec(dllexport) int RetroXInputBindings(HMODULE exe) {
+    Image im(exe);
+    BYTE *reg, *add, *main;
+    if (!im.pad_binding_sites(&reg, &add, &main)) { say("pad bindings already loaded or LoadBindings not found, left alone"); return 0; }
+    g_register = (register_fn)Image::call_target(reg);
+    g_add = (add_fn)Image::call_target(add);
+    g_add_main = (add_fn)main;
+    if (!redirect_call(im.base, reg, (void*)&register_hook) || !redirect_call(im.base, add, (void*)&add_hook)) {
+        say("could not redirect the LoadBindings calls");
+        return 0;
+    }
+    say("LoadBindings calls at +%x and +%x now also load the Xbox pad bindings (AddBindings at +%x)",
+        im.rva(reg), im.rva(add), im.rva(main));
+    return 1;
+}
+
 typedef int(__cdecl* initterm_e_fn)(void*, void*);
 static initterm_e_fn g_initterm_e;
 static void** g_initterm_e_slot;
@@ -251,6 +370,7 @@ static void** g_initterm_e_slot;
 static int __cdecl initterm_e_hook(void* first, void* last) {
     put(g_initterm_e_slot, &g_initterm_e, sizeof(void*));
     RetroXInputPatch(GetModuleHandleA(nullptr));
+    RetroXInputBindings(GetModuleHandleA(nullptr));
     return g_initterm_e(first, last);
 }
 
@@ -273,5 +393,6 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD why, LPVOID) {
         if (put(slot, &hook, sizeof(void*))) return TRUE;
     }
     RetroXInputPatch(exe);
+    RetroXInputBindings(exe);
     return TRUE;
 }
